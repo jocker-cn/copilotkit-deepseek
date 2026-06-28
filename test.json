@@ -1,0 +1,115 @@
+{
+  "request": {
+    "model": "deepseek-v4-flash",
+    "messages": [
+      {
+        "role": "system",
+        "content": "你是一个发布管理助手。\n当用户表达勾选、取消勾选清单项的意图时，优先调用工具 set_checklist_item。\n不要假装已经操作界面，应该通过工具调用表达操作意 图。\n"
+      },
+      {
+        "role": "user",
+        "content": "帮我勾选亮点产品"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "set_checklist_item",
+          "description": "勾选或取消勾选发布清单里的指定项目。",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "label": {
+                "type": "string",
+                "description": "清单项名称，例如：亮点产品、发布渠道、发布时间"
+              },
+              "checked": {
+                "type": "boolean",
+                "description": "true 表示勾选，false 表示取消勾选"
+              }
+            },
+            "required": [
+              "label",
+              "checked"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "stream": false,
+    "apiKey": "***"
+  },
+  "rawResponse": {
+    "id": "fb0a37d8-4654-4ab3-a7c1-92f5d6ac0b81",
+    "object": "chat.completion",
+    "created": 1782635535,
+    "model": "deepseek-v4-flash",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "好的，我来帮你勾选\"亮点产品\"。",
+          "reasoning_content": "用户想勾选\"亮点产品\"这个清单项。我需要调用 set_checklist_item 工具，设置 label 为\"亮点产品\"，checked 为 true。",
+          "tool_calls": [
+            {
+              "index": 0,
+              "id": "call_00_AYP8UILQXxJC6ZL6pql41707",
+              "type": "function",
+              "function": {
+                "name": "set_checklist_item",
+                "arguments": "{\"label\": \"亮点产品\", \"checked\": true}"
+              }
+            }
+          ]
+        },
+        "logprobs": null,
+        "finish_reason": "tool_calls"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 374,
+      "completion_tokens": 107,
+      "total_tokens": 481,
+      "prompt_tokens_details": {
+        "cached_tokens": 256
+      },
+      "completion_tokens_details": {
+        "reasoning_tokens": 34
+      },
+      "prompt_cache_hit_tokens": 256,
+      "prompt_cache_miss_tokens": 118
+    },
+    "system_fingerprint": "fp_8b330d02d0_prod0820_fp8_kvcache_20260402"
+  },
+  "assistantMessage": {
+    "role": "assistant",
+    "content": "好的，我来帮你勾选\"亮点产品\"。",
+    "reasoning_content": "用户想勾选\"亮点产品\"这个清单项。我需要调用 set_checklist_item 工具，设置 label 为\"亮点产品\"，checked 为 true 。",
+    "tool_calls": [
+      {
+        "index": 0,
+        "id": "call_00_AYP8UILQXxJC6ZL6pql41707",
+        "type": "function",
+        "function": {
+          "name": "set_checklist_item",
+          "arguments": "{\"label\": \"亮点产品\", \"checked\": true}"
+        }
+      }
+    ]
+  },
+  "toolCalls": [
+    {
+      "index": 0,
+      "id": "call_00_AYP8UILQXxJC6ZL6pql41707",
+      "type": "function",
+      "function": {
+        "name": "set_checklist_item",
+        "arguments": "{\"label\": \"亮点产品\", \"checked\": true}"
+      }
+    }
+  ],
+  "content": "好的，我来帮你勾选\"亮点产品\"。"
+}

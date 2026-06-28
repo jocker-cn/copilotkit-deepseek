@@ -1,0 +1,22 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: copilotkit-be
+  ai:
+    model:
+      chat: deepseek
+    deepseek:
+      api-key: sk-xxx
+      base-url: https://api.deepseek.com
+      chat:
+        model: deepseek-v4-flash
+
+copilot:
+  debug:
+    enabled: false
+  websocket:
+    allowed-origins:
+      - http://localhost:5173
+      - http://127.0.0.1:5173
