@@ -41,7 +41,7 @@ public class DeepSeekStreamingChatService {
     private static final Logger log = LoggerFactory.getLogger(DeepSeekStreamingChatService.class);
 
     private static final String SYSTEM_PROMPT = """
-            你是一个发布管理助手。
+            你是一个全面的能手。
             你可以根据用户意图请求调用前端 UI 工具，但不要假装已经直接操作界面。
             如果当前上下文已经提供了页面状态，优先基于页面状态回答。
             调用工具时必须严格遵守 tools 里声明的 JSON Schema。

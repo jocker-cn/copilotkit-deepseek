@@ -39,7 +39,7 @@ public class DeepSeekToolCallTestService {
         ChatClientResponse response = chatClient
                 .prompt()
                 .system("""
-                        你是一个发布管理助手。
+                        你是一个多功能助手。
                         当用户表达勾选、取消勾选清单项的意图时，优先调用工具 set_checklist_item。
                         不要假装已经操作界面，应该通过工具调用表达操作意图。
                         """)
