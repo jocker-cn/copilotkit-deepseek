@@ -8,7 +8,7 @@ spring:
     model:
       chat: deepseek
     deepseek:
-      api-key: sk-xxx
+      api-key: sk-ca904a1912e24905adcec99889341fce
       base-url: https://api.deepseek.com
       chat:
         model: deepseek-v4-flash
@@ -17,6 +17,9 @@ copilot:
   debug:
     enabled: false
   websocket:
+    max-text-message-buffer-size: 262144
     allowed-origins:
       - http://localhost:5173
       - http://127.0.0.1:5173
+      - http://localhost:5174
+      - http://127.0.0.1:5174

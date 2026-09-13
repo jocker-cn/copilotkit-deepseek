@@ -1,6 +1,8 @@
 package com.copilotkit.be.websocket;
 
+import com.copilotkit.be.config.CopilotWebSocketProperties;
 import com.copilotkit.be.protocol.AgUiRunMapper;
+import com.copilotkit.be.protocol.ChatStreamRequest;
 import com.copilotkit.be.protocol.ClientRunRequest;
 import com.copilotkit.be.protocol.ServerMessage;
 import com.copilotkit.be.service.DeepSeekStreamingChatService;
@@ -23,22 +25,27 @@ public class CopilotSocketHandler extends TextWebSocketHandler {
     private final DeepSeekStreamingChatService chatService;
     private final boolean debugEnabled;
     private final ObjectMapper objectMapper;
+    private final CopilotWebSocketProperties websocketProperties;
 
     public CopilotSocketHandler(
             AgUiRunMapper agUiRunMapper,
             DeepSeekStreamingChatService chatService,
             @Value("${copilot.debug.enabled:false}") boolean debugEnabled,
-            ObjectMapper objectMapper
+            ObjectMapper objectMapper,
+            CopilotWebSocketProperties websocketProperties
     ) {
         this.agUiRunMapper = agUiRunMapper;
         this.chatService = chatService;
         this.debugEnabled = debugEnabled;
         this.objectMapper = objectMapper;
+        this.websocketProperties = websocketProperties;
     }
 
     @Override
     public void afterConnectionEstablished(WebSocketSession session) {
-        // Keep the socket open and reuse it for multiple chat runs.
+        session.setTextMessageSizeLimit(websocketProperties.getMaxTextMessageBufferSize());
+        log.info("[CopilotTrace] WebSocket connected. sessionId={}, remoteAddress={}, maxTextMessageBufferSize={}",
+                session.getId(), session.getRemoteAddress(), session.getTextMessageSizeLimit());
     }
 
     @Override
@@ -49,15 +56,24 @@ public class CopilotSocketHandler extends TextWebSocketHandler {
 
         ClientRunRequest request = objectMapper.readValue(message.getPayload(), ClientRunRequest.class);
         if (!"run".equals(request.event())) {
+            log.warn("[CopilotTrace] Unsupported WebSocket event. sessionId={}, event={}",
+                    session.getId(), request.event());
             session.sendMessage(new TextMessage(objectMapper.writeValueAsString(ServerMessage.error("Unsupported event: " + request.event()))));
             return;
         }
 
-        chatService.streamToWebSocket(agUiRunMapper.toChatStreamRequest(request), session);
+        ChatStreamRequest streamRequest = agUiRunMapper.toChatStreamRequest(request);
+        log.info("[CopilotTrace] WebSocket run received. sessionId={}, threadId={}, messageLength={}, toolCount={}",
+                session.getId(),
+                streamRequest.threadId(),
+                streamRequest.message() == null ? 0 : streamRequest.message().length(),
+                streamRequest.tools() == null ? 0 : streamRequest.tools().size());
+        chatService.streamToWebSocket(streamRequest, session);
     }
 
     @Override
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
-        // Session scoped resources should be released here when streaming DeepSeek is connected.
+        log.info("[CopilotTrace] WebSocket closed. sessionId={}, code={}, reason={}",
+                session.getId(), status.getCode(), status.getReason());
     }
 }

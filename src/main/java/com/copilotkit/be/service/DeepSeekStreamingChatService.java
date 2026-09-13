@@ -34,6 +34,8 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 
 @Service
 public class DeepSeekStreamingChatService {
@@ -56,6 +58,7 @@ public class DeepSeekStreamingChatService {
     private final String baseUrl;
     private final boolean debugEnabled;
     private final String model;
+    private final AtomicInteger activeStreams = new AtomicInteger();
 
     public DeepSeekStreamingChatService(
             ChatHistoryService chatHistoryService,
@@ -78,19 +81,27 @@ public class DeepSeekStreamingChatService {
 
     public SseEmitter stream(ChatStreamRequest request) {
         SseEmitter emitter = new SseEmitter(0L);
-        Thread.startVirtualThread(() -> streamOnCurrentThread(request, new SseServerMessageSink(emitter)));
+        String traceId = createTraceId();
+        log.info("[CopilotTrace] Stream scheduled. traceId={}, transport=sse, threadId={}",
+                traceId, request.threadId());
+        Thread.startVirtualThread(() -> streamOnCurrentThread(request, new SseServerMessageSink(emitter), traceId));
         return emitter;
     }
 
     public void streamToWebSocket(ChatStreamRequest request, WebSocketSession session) {
-        Thread.startVirtualThread(() -> streamOnCurrentThread(request, new WebSocketServerMessageSink(session)));
+        String traceId = createTraceId();
+        log.info("[CopilotTrace] Stream scheduled. traceId={}, transport=websocket, sessionId={}, threadId={}",
+                traceId, session.getId(), request.threadId());
+        Thread.startVirtualThread(() -> streamOnCurrentThread(request, new WebSocketServerMessageSink(session), traceId));
     }
 
-    private void streamOnCurrentThread(ChatStreamRequest request, ServerMessageSink sink) {
+    private void streamOnCurrentThread(ChatStreamRequest request, ServerMessageSink sink, String traceId) {
+        long runStartedAt = System.nanoTime();
         String assistantMessageId = "assistant-" + Instant.now().toEpochMilli();
         String reasoningMessageId = assistantMessageId + "-reasoning";
-        List<ChatHistoryMessage> recentMessages = chatHistoryService.getRecentMessages(request.threadId());
-        chatHistoryService.append(request.threadId(), ChatHistoryMessage.user(request.message()));
+        int activeStreamCount = activeStreams.incrementAndGet();
+        log.info("[CopilotTrace] Stream task started. traceId={}, threadId={}, virtualThread={}, activeStreams={}",
+                traceId, request.threadId(), Thread.currentThread().isVirtual(), activeStreamCount);
 
         StringBuilder reasoningContent = new StringBuilder();
         StringBuilder assistantContent = new StringBuilder();
@@ -98,12 +109,25 @@ public class DeepSeekStreamingChatService {
         StreamState streamState = new StreamState();
 
         try {
+            log.info("[CopilotTrace] Loading chat history. traceId={}, threadId={}", traceId, request.threadId());
+            List<ChatHistoryMessage> recentMessages = chatHistoryService.getRecentMessages(request.threadId());
+            chatHistoryService.append(request.threadId(), ChatHistoryMessage.user(request.message()));
+            log.info("[CopilotTrace] Chat history ready. traceId={}, threadId={}, historyCount={}",
+                    traceId, request.threadId(), recentMessages.size());
+
             sink.send(ServerMessage.runStarted());
+            log.info("[CopilotTrace] run_started sent. traceId={}, threadId={}", traceId, request.threadId());
 
             String requestJson = writeJson(createDeepSeekRequest(request, recentMessages));
             if (debugEnabled) {
                 log.info("[CopilotDebug] LLM request payload: {}", writePrettyJson(readJson(requestJson)));
             }
+            log.info("[CopilotTrace] LLM request sending. traceId={}, threadId={}, model={}, historyCount={}, requestBytes={}",
+                    traceId,
+                    request.threadId(),
+                    model,
+                    recentMessages.size(),
+                    requestJson.getBytes(StandardCharsets.UTF_8).length);
             HttpRequest httpRequest = HttpRequest.newBuilder()
                     .uri(URI.create(trimTrailingSlash(baseUrl) + "/chat/completions"))
                     .timeout(Duration.ofMinutes(5))
@@ -112,9 +136,20 @@ public class DeepSeekStreamingChatService {
                     .POST(HttpRequest.BodyPublishers.ofString(requestJson, StandardCharsets.UTF_8))
                     .build();
 
+            long httpStartedAt = System.nanoTime();
             HttpResponse<InputStream> response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofInputStream());
+            log.info("[CopilotTrace] LLM response headers received. traceId={}, threadId={}, status={}, elapsedMs={}",
+                    traceId,
+                    request.threadId(),
+                    response.statusCode(),
+                    elapsedMillis(httpStartedAt));
             if (response.statusCode() < 200 || response.statusCode() >= 300) {
                 String errorBody = readAll(response.body());
+                log.warn("[CopilotTrace] LLM request rejected. traceId={}, threadId={}, status={}, responseBytes={}",
+                        traceId,
+                        request.threadId(),
+                        response.statusCode(),
+                        errorBody.getBytes(StandardCharsets.UTF_8).length);
                 if (debugEnabled) {
                     log.info("[CopilotDebug] LLM error response: {}", errorBody);
                 }
@@ -123,10 +158,17 @@ public class DeepSeekStreamingChatService {
                 return;
             }
 
-            readStream(response.body(), sink, assistantMessageId, reasoningMessageId, reasoningContent, assistantContent, streamingToolCalls, streamState);
+            readStream(response.body(), sink, assistantMessageId, reasoningMessageId, reasoningContent, assistantContent, streamingToolCalls, streamState, traceId, request.threadId());
             completeOpenSections(sink, assistantMessageId, reasoningMessageId, streamState);
             emitToolCalls(sink, streamingToolCalls, request);
             sink.send(ServerMessage.completed());
+            log.info("[CopilotTrace] completed sent. traceId={}, threadId={}, reasoningChars={}, answerChars={}, toolCallCount={}, totalElapsedMs={}",
+                    traceId,
+                    request.threadId(),
+                    reasoningContent.length(),
+                    assistantContent.length(),
+                    streamingToolCalls.size(),
+                    elapsedMillis(runStartedAt));
 
             chatHistoryService.append(
                     request.threadId(),
@@ -138,12 +180,20 @@ public class DeepSeekStreamingChatService {
             );
             sink.complete();
         } catch (Exception exception) {
+            log.error("[CopilotTrace] Stream failed. traceId={}, threadId={}, elapsedMs={}",
+                    traceId, request.threadId(), elapsedMillis(runStartedAt), exception);
             try {
                 sink.send(ServerMessage.error(exception.getMessage()));
+                log.info("[CopilotTrace] error sent. traceId={}, threadId={}", traceId, request.threadId());
             } catch (IOException ignored) {
-                // The client may already be disconnected.
+                log.warn("[CopilotTrace] Failed to send error to client. traceId={}, threadId={}",
+                        traceId, request.threadId(), ignored);
             }
             sink.completeWithError(exception);
+        } finally {
+            int remainingStreams = activeStreams.decrementAndGet();
+            log.info("[CopilotTrace] Stream task finished. traceId={}, threadId={}, activeStreams={}, totalElapsedMs={}",
+                    traceId, request.threadId(), remainingStreams, elapsedMillis(runStartedAt));
         }
     }
 
@@ -226,23 +276,57 @@ public class DeepSeekStreamingChatService {
             StringBuilder reasoningContent,
             StringBuilder assistantContent,
             Map<Integer, StreamingToolCall> streamingToolCalls,
-            StreamState streamState
+            StreamState streamState,
+            String traceId,
+            String threadId
     ) throws IOException {
+        long streamStartedAt = System.nanoTime();
+        int dataChunkCount = 0;
+        boolean doneReceived = false;
+        boolean firstDataLogged = false;
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream, StandardCharsets.UTF_8))) {
             String line;
             while ((line = reader.readLine()) != null) {
                 if (line.isBlank() || !line.startsWith("data:")) continue;
 
                 String data = line.substring("data:".length()).trim();
-                if ("[DONE]".equals(data)) break;
+                if ("[DONE]".equals(data)) {
+                    doneReceived = true;
+                    break;
+                }
+
+                dataChunkCount += 1;
+                if (!firstDataLogged) {
+                    firstDataLogged = true;
+                    log.info("[CopilotTrace] First LLM SSE data received. traceId={}, threadId={}, elapsedMs={}",
+                            traceId, threadId, elapsedMillis(streamStartedAt));
+                }
 
                 JsonNode chunk = readJson(data);
                 JsonNode delta = chunk.path("choices").path(0).path("delta");
+                boolean hadThinking = streamState.thinkingStarted;
+                boolean hadContent = streamState.contentStarted;
                 handleReasoningDelta(sink, reasoningMessageId, delta, reasoningContent, streamState);
                 handleContentDelta(sink, assistantMessageId, reasoningMessageId, delta, assistantContent, streamState);
                 handleToolCallDelta(delta, streamingToolCalls);
+                if (!hadThinking && streamState.thinkingStarted) {
+                    log.info("[CopilotTrace] First thinking event forwarded. traceId={}, threadId={}", traceId, threadId);
+                }
+                if (!hadContent && streamState.contentStarted) {
+                    log.info("[CopilotTrace] First answer event forwarded. traceId={}, threadId={}", traceId, threadId);
+                }
             }
         }
+        log.info("[CopilotTrace] LLM SSE stream ended. traceId={}, threadId={}, dataChunkCount={}, doneReceived={}, elapsedMs={}",
+                traceId, threadId, dataChunkCount, doneReceived, elapsedMillis(streamStartedAt));
+    }
+
+    private String createTraceId() {
+        return UUID.randomUUID().toString().substring(0, 8);
+    }
+
+    private long elapsedMillis(long startedAt) {
+        return Duration.ofNanos(System.nanoTime() - startedAt).toMillis();
     }
 
     private void handleReasoningDelta(
