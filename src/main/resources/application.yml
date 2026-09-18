@@ -8,10 +8,10 @@ spring:
     model:
       chat: deepseek
     deepseek:
-      api-key: sk-ca904a1912e24905adcec99889341fce
+      api-key:
       base-url: https://api.deepseek.com
       chat:
-        model: deepseek-v4-flash
+        model: deepseek-flash
 
 copilot:
   debug:
