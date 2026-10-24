@@ -8,6 +8,7 @@ import com.copilotkit.be.protocol.UiToolDefinition;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.MappingIterator;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -27,9 +28,9 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -58,6 +59,9 @@ public class DeepSeekStreamingChatService {
     private final String baseUrl;
     private final boolean debugEnabled;
     private final String model;
+    private final boolean demoToolEnabled;
+    private static final String DEMO_TOOL = "demo_calculate_sum";
+    private static final int MAX_MODEL_REQUESTS = 3;
     private final AtomicInteger activeStreams = new AtomicInteger();
 
     public DeepSeekStreamingChatService(
@@ -66,7 +70,8 @@ public class DeepSeekStreamingChatService {
             @Value("${spring.ai.deepseek.api-key}") String apiKey,
             @Value("${spring.ai.deepseek.base-url}") String baseUrl,
             @Value("${copilot.debug.enabled:false}") boolean debugEnabled,
-            @Value("${spring.ai.deepseek.chat.model}") String model
+            @Value("${spring.ai.deepseek.chat.model}") String model,
+            @Value("${copilot.demo-tool.enabled:false}") boolean demoToolEnabled
     ) {
         this.chatHistoryService = chatHistoryService;
         this.httpClient = HttpClient.newBuilder()
@@ -77,6 +82,7 @@ public class DeepSeekStreamingChatService {
         this.baseUrl = baseUrl;
         this.debugEnabled = debugEnabled;
         this.model = model;
+        this.demoToolEnabled = demoToolEnabled;
     }
 
     public SseEmitter stream(ChatStreamRequest request) {
@@ -97,16 +103,14 @@ public class DeepSeekStreamingChatService {
 
     private void streamOnCurrentThread(ChatStreamRequest request, ServerMessageSink sink, String traceId) {
         long runStartedAt = System.nanoTime();
-        String assistantMessageId = "assistant-" + Instant.now().toEpochMilli();
-        String reasoningMessageId = assistantMessageId + "-reasoning";
+        String responseId = "assistant-" + UUID.randomUUID();
         int activeStreamCount = activeStreams.incrementAndGet();
         log.info("[CopilotTrace] Stream task started. traceId={}, threadId={}, virtualThread={}, activeStreams={}",
                 traceId, request.threadId(), Thread.currentThread().isVirtual(), activeStreamCount);
 
-        StringBuilder reasoningContent = new StringBuilder();
-        StringBuilder assistantContent = new StringBuilder();
-        Map<Integer, StreamingToolCall> streamingToolCalls = new LinkedHashMap<>();
-        StreamState streamState = new StreamState();
+        StringBuilder allReasoning = new StringBuilder();
+        StringBuilder allAnswers = new StringBuilder();
+        List<Map<String, Object>> historyCalls = new ArrayList<>();
 
         try {
             log.info("[CopilotTrace] Loading chat history. traceId={}, threadId={}", traceId, request.threadId());
@@ -118,67 +122,118 @@ public class DeepSeekStreamingChatService {
             sink.send(ServerMessage.runStarted());
             log.info("[CopilotTrace] run_started sent. traceId={}, threadId={}", traceId, request.threadId());
 
-            String requestJson = writeJson(createDeepSeekRequest(request, recentMessages));
-            if (debugEnabled) {
-                log.info("[CopilotDebug] LLM request payload: {}", writePrettyJson(readJson(requestJson)));
+            ObjectNode body = createDeepSeekRequest(request, recentMessages);
+            boolean demo = demoToolEnabled && (request.tools() == null || request.tools().isEmpty());
+            if (demo) {
+                body.set("tools", createDemoTools());
+                body.put("tool_choice", "auto");
+                ((ArrayNode) body.get("messages")).add(createMessage("system",
+                        "计算数字之和时使用 demo_calculate_sum 工具，收到工具结果后再回答，不要编造工具结果。"));
             }
-            log.info("[CopilotTrace] LLM request sending. traceId={}, threadId={}, model={}, historyCount={}, requestBytes={}",
-                    traceId,
-                    request.threadId(),
-                    model,
-                    recentMessages.size(),
-                    requestJson.getBytes(StandardCharsets.UTF_8).length);
-            HttpRequest httpRequest = HttpRequest.newBuilder()
-                    .uri(URI.create(trimTrailingSlash(baseUrl) + "/chat/completions"))
-                    .timeout(Duration.ofMinutes(5))
-                    .header("Authorization", "Bearer " + apiKey)
-                    .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(requestJson, StandardCharsets.UTF_8))
-                    .build();
+            for (int round = 0; round < MAX_MODEL_REQUESTS; round++) {
+                String assistantMessageId = responseId + "-" + round;
+                String reasoningMessageId = assistantMessageId + "-reasoning";
+                StringBuilder reasoningContent = new StringBuilder();
+                StringBuilder assistantContent = new StringBuilder();
+                Map<Integer, StreamingToolCall> streamingToolCalls = new LinkedHashMap<>();
+                StreamState streamState = new StreamState();
+                String requestJson = writeJson(body);
+                if (debugEnabled) {
+                    log.info("[CopilotDebug] LLM request payload: {}", writePrettyJson(readJson(requestJson)));
+                }
+                log.info("[CopilotTrace] LLM request sending. traceId={}, threadId={}, model={}, historyCount={}, requestBytes={}",
+                        traceId,
+                        request.threadId(),
+                        model,
+                        recentMessages.size(),
+                        requestJson.getBytes(StandardCharsets.UTF_8).length);
+                HttpRequest httpRequest = HttpRequest.newBuilder()
+                        .uri(URI.create(trimTrailingSlash(baseUrl) + "/chat/completions"))
+                        .timeout(Duration.ofMinutes(5))
+                        .header("Authorization", "Bearer " + apiKey)
+                        .header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString(requestJson, StandardCharsets.UTF_8))
+                        .build();
 
-            long httpStartedAt = System.nanoTime();
-            HttpResponse<InputStream> response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofInputStream());
-            log.info("[CopilotTrace] LLM response headers received. traceId={}, threadId={}, status={}, elapsedMs={}",
-                    traceId,
-                    request.threadId(),
-                    response.statusCode(),
-                    elapsedMillis(httpStartedAt));
-            if (response.statusCode() < 200 || response.statusCode() >= 300) {
-                String errorBody = readAll(response.body());
-                log.warn("[CopilotTrace] LLM request rejected. traceId={}, threadId={}, status={}, responseBytes={}",
+                long httpStartedAt = System.nanoTime();
+                HttpResponse<InputStream> response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofInputStream());
+                log.info("[CopilotTrace] LLM response headers received. traceId={}, threadId={}, status={}, elapsedMs={}",
                         traceId,
                         request.threadId(),
                         response.statusCode(),
-                        errorBody.getBytes(StandardCharsets.UTF_8).length);
-                if (debugEnabled) {
-                    log.info("[CopilotDebug] LLM error response: {}", errorBody);
+                        elapsedMillis(httpStartedAt));
+                if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                    String errorBody = readAll(response.body());
+                    log.warn("[CopilotTrace] LLM request rejected. traceId={}, threadId={}, status={}, responseBytes={}",
+                            traceId,
+                            request.threadId(),
+                            response.statusCode(),
+                            errorBody.getBytes(StandardCharsets.UTF_8).length);
+                    if (debugEnabled) {
+                        log.info("[CopilotDebug] LLM error response: {}", errorBody);
+                    }
+                    sink.send(ServerMessage.error(errorBody));
+                    sink.complete();
+                    return;
                 }
-                sink.send(ServerMessage.error(errorBody));
+
+                readStream(response.body(), sink, assistantMessageId, reasoningMessageId, reasoningContent, assistantContent, streamingToolCalls, streamState, traceId, request.threadId());
+                completeOpenSections(sink, assistantMessageId, reasoningMessageId, streamState);
+                allReasoning.append(reasoningContent);
+                allAnswers.append(assistantContent);
+                historyCalls.addAll(toHistoryToolCalls(streamingToolCalls, request));
+                emitToolCalls(sink, streamingToolCalls, request);
+                if (demo && !streamingToolCalls.isEmpty()) {
+                    if (round == MAX_MODEL_REQUESTS - 1) throw new IllegalStateException("Demo tool model-request limit reached (3).");
+                    ArrayNode messages = (ArrayNode) body.get("messages");
+                    ObjectNode assistant = createMessage("assistant", assistantContent.toString());
+                    assistant.put("reasoning_content", reasoningContent.toString());
+                    ArrayNode calls = objectMapper.createArrayNode();
+                    for (StreamingToolCall call : streamingToolCalls.values()) {
+                        if (!DEMO_TOOL.equals(call.name)) throw new IllegalArgumentException("Unsupported demo tool: " + call.name);
+                        if (call.id == null || call.id.isBlank()) throw new IllegalArgumentException("Missing tool_call id.");
+                        ObjectNode function = objectMapper.createObjectNode();
+                        function.put("name", call.name);
+                        function.put("arguments", call.arguments.toString());
+                        ObjectNode toolCall = objectMapper.createObjectNode();
+                        toolCall.put("id", call.id);
+                        toolCall.put("type", "function");
+                        toolCall.set("function", function);
+                        calls.add(toolCall);
+                    }
+                    assistant.set("tool_calls", calls);
+                    messages.add(assistant);
+                    for (StreamingToolCall call : streamingToolCalls.values()) {
+                        JsonNode arguments = objectMapper.reader().with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+                                .readTree(call.arguments.toString());
+                        String result = writeJson(calculateDemoSum(arguments));
+                        sink.send(ServerMessage.toolResult(call.id, call.name, result));
+                        ObjectNode tool = createMessage("tool", result);
+                        tool.put("tool_call_id", call.id);
+                        messages.add(tool);
+                    }
+                    continue;
+                }
+                sink.send(ServerMessage.completed());
+                log.info("[CopilotTrace] completed sent. traceId={}, threadId={}, reasoningChars={}, answerChars={}, toolCallCount={}, totalElapsedMs={}",
+                        traceId,
+                        request.threadId(),
+                        reasoningContent.length(),
+                        assistantContent.length(),
+                        streamingToolCalls.size(),
+                        elapsedMillis(runStartedAt));
+
+                chatHistoryService.append(
+                        request.threadId(),
+                        ChatHistoryMessage.assistant(
+                                allAnswers.toString(),
+                                allReasoning.toString(),
+                                historyCalls
+                        )
+                );
                 sink.complete();
-                return;
+                break;
             }
-
-            readStream(response.body(), sink, assistantMessageId, reasoningMessageId, reasoningContent, assistantContent, streamingToolCalls, streamState, traceId, request.threadId());
-            completeOpenSections(sink, assistantMessageId, reasoningMessageId, streamState);
-            emitToolCalls(sink, streamingToolCalls, request);
-            sink.send(ServerMessage.completed());
-            log.info("[CopilotTrace] completed sent. traceId={}, threadId={}, reasoningChars={}, answerChars={}, toolCallCount={}, totalElapsedMs={}",
-                    traceId,
-                    request.threadId(),
-                    reasoningContent.length(),
-                    assistantContent.length(),
-                    streamingToolCalls.size(),
-                    elapsedMillis(runStartedAt));
-
-            chatHistoryService.append(
-                    request.threadId(),
-                    ChatHistoryMessage.assistant(
-                            assistantContent.toString(),
-                            reasoningContent.toString(),
-                            toHistoryToolCalls(streamingToolCalls, request)
-                    )
-            );
-            sink.complete();
         } catch (Exception exception) {
             log.error("[CopilotTrace] Stream failed. traceId={}, threadId={}, elapsedMs={}",
                     traceId, request.threadId(), elapsedMillis(runStartedAt), exception);
@@ -225,7 +280,11 @@ public class DeepSeekStreamingChatService {
             } else if ("assistant".equals(historyMessage.role())) {
                 String assistantHistory = buildAssistantHistoryContent(historyMessage);
                 if (!assistantHistory.isBlank()) {
-                    messages.add(createMessage("assistant", assistantHistory));
+                    ObjectNode assistant = createMessage("assistant", assistantHistory);
+                    if (demoToolEnabled && historyMessage.reasoningContent() != null) {
+                        assistant.put("reasoning_content", historyMessage.reasoningContent());
+                    }
+                    messages.add(assistant);
                 }
             }
         }
@@ -266,6 +325,38 @@ public class DeepSeekStreamingChatService {
             tools.add(tool);
         }
         return tools;
+    }
+
+    private ArrayNode createDemoTools() {
+        ObjectNode parameters = objectMapper.createObjectNode();
+        parameters.put("type", "object");
+        ObjectNode numbers = objectMapper.createObjectNode();
+        numbers.put("type", "array");
+        numbers.set("items", objectMapper.createObjectNode().put("type", "number"));
+        parameters.set("properties", objectMapper.createObjectNode().set("numbers", numbers));
+        parameters.set("required", objectMapper.createArrayNode().add("numbers"));
+        parameters.put("additionalProperties", false);
+        return createTools(List.of(new UiToolDefinition(DEMO_TOOL,
+                "Calculate the sum of the supplied numbers. Returns the original input, count and exact sum.",
+                objectMapper.convertValue(parameters, Map.class))));
+    }
+
+    private ObjectNode calculateDemoSum(JsonNode arguments) {
+        JsonNode numbers = arguments.path("numbers");
+        if (!arguments.isObject() || !numbers.isArray() || numbers.size() > 1000) {
+            throw new IllegalArgumentException("demo_calculate_sum requires a numbers array (at most 1000 values).");
+        }
+        BigDecimal sum = BigDecimal.ZERO;
+        for (JsonNode number : numbers) {
+            if (!number.isNumber()) throw new IllegalArgumentException("Every numbers item must be numeric.");
+            sum = sum.add(number.decimalValue());
+        }
+        ObjectNode result = objectMapper.createObjectNode();
+        result.put("tool", DEMO_TOOL);
+        result.set("numbers", numbers.deepCopy());
+        result.put("count", numbers.size());
+        result.put("sum", sum);
+        return result;
     }
 
     private void readStream(
@@ -319,6 +410,7 @@ public class DeepSeekStreamingChatService {
         }
         log.info("[CopilotTrace] LLM SSE stream ended. traceId={}, threadId={}, dataChunkCount={}, doneReceived={}, elapsedMs={}",
                 traceId, threadId, dataChunkCount, doneReceived, elapsedMillis(streamStartedAt));
+        if (!doneReceived) throw new IOException("Model stream ended before [DONE].");
     }
 
     private String createTraceId() {
@@ -419,7 +511,7 @@ public class DeepSeekStreamingChatService {
                             writeDebugJson(arguments)
                     );
                 }
-                sink.send(ServerMessage.functionCall(streamingToolCall.name, arguments));
+                sink.send(ServerMessage.functionCall(streamingToolCall.id, streamingToolCall.name, arguments));
             }
         }
     }

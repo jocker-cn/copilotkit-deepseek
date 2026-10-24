@@ -39,6 +39,14 @@ public record ServerMessage(Boolean isCompleted, String event, Message message, 
         return new ServerMessage(false, "function_call", new Message(null, null, name, arguments), null);
     }
 
+    public static ServerMessage functionCall(String id, String name, Map<String, Object> arguments) {
+        return new ServerMessage(false, "function_call", new Message(id, null, name, arguments), null);
+    }
+
+    public static ServerMessage toolResult(String id, String name, String content) {
+        return new ServerMessage(false, "tool_result", new Message(id, content, name, null), null);
+    }
+
     public static ServerMessage completed() {
         return new ServerMessage(true, "completed", null, null);
     }

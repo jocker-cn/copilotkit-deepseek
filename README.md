@@ -80,6 +80,18 @@ curl -X POST "http://localhost:8080/api/deepseek/tool-call" \
 
 ## Streaming chat smoke test
 
+### Optional local tool loop
+
+The streaming service includes an opt-in `demo_calculate_sum(numbers)` tool. Enable it without editing `application.yml`:
+
+```bash
+mvn spring-boot:run "-Dspring-boot.run.arguments=--copilot.demo-tool.enabled=true"
+```
+
+It is off by default and is registered only when the request supplies no frontend UI tools. Ask the model to use `demo_calculate_sum` to add a few numbers. The backend executes the sum with BigDecimal, emits a `tool_result` with the original call ID and complete JSON (`tool`, `numbers`, `count`, `sum`), and passes the assistant tool call, reasoning and matching tool result back to the model before the final streamed answer. There is one terminal `completed` per whole run and at most three model requests; invalid arguments, unsupported demo tools, premature stream closure and the request limit end with an error.
+
+The existing frontend-tool path and independent tool-call test endpoint retain their original execution semantics. This is a small local demonstration, not an MCP executor. In `/extension-poc`, the optional “查看响应过程” action opens the independently recorded run after it finishes; earlier events remain inspectable even if intermediate messages are filtered from the chat.
+
 This endpoint calls the DeepSeek OpenAI-compatible streaming API directly so the server can split:
 
 - `reasoning_content` -> `thinking_*`
